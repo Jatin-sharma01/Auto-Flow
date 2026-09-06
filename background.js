@@ -1,13 +1,7 @@
 // ============================================================
 // Auto Flow - Chrome/Chromium Version (Background Service Worker)
-// Uses direct API calls to Google Flow — no DOM interaction.
+// Uses DOM automation (typing + clicking) to interact with Flow.
 // ============================================================
-
-let cachedRecaptchaKey = null;
-
-let cachedToken = null;
-let tokenTimestamp = 0;
-const TOKEN_TTL = 5 * 60 * 1000; // 5 minutes
 
 let stopRequested = false;
 
@@ -36,27 +30,12 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function generateUUID() {
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
-    const r = (Math.random() * 16) | 0;
-    return (c === "x" ? r : (r & 3) | 8).toString(16);
-  });
-}
-
-function randomSeed() {
-  return Math.floor(Math.random() * 300000);
-}
-
 function sanitizeFilename(text) {
   return String(text || "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .substring(0, 40) || "image";
-}
-
-function isFlowUrl(url) {
-  return /^https:\/\/labs\.google\/fx(\/[a-z]{2}(?:-[a-z]{2})?)?\/tools\/flow\//.test(url);
 }
 
 // ---- Send progress to side panel ----
@@ -70,7 +49,8 @@ function broadcast(type, data) {
 async function findFlowTab() {
   const patterns = [
     "https://labs.google/fx/tools/flow/*",
-    "https://labs.google/fx/*/tools/flow/*"
+    "https://labs.google/fx/*/tools/flow/*",
+    "https://flow.google.com/*"
   ];
   const allTabs = [];
   for (const pattern of patterns) {
@@ -79,35 +59,6 @@ async function findFlowTab() {
   const unique = [...new Map(allTabs.map(t => [t.id, t])).values()];
   unique.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
   return unique[0] || null;
-}
-
-// ---- Get auth token from the Flow page session ----
-
-async function getAuthToken(tabId, forceRefresh = false) {
-  if (!forceRefresh && cachedToken && Date.now() - tokenTimestamp < TOKEN_TTL) {
-    return cachedToken;
-  }
-
-  const result = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: async () => {
-      try {
-        const res = await fetch("/fx/api/auth/session", { credentials: "include" });
-        const data = await res.json();
-        return data.access_token || null;
-      } catch {
-        return null;
-      }
-    }
-  }).catch(() => null);
-
-  const token = result?.[0]?.result || null;
-  if (token) {
-    cachedToken = token;
-    tokenTimestamp = Date.now();
-  }
-  return token;
 }
 
 // ---- Get project ID from the Flow URL ----
@@ -125,217 +76,224 @@ async function getProjectId(tabId) {
   return result?.[0]?.result || null;
 }
 
-// ---- Get reCAPTCHA site key dynamically ----
+// ---- Generate a single image via DOM automation ----
+// Types the prompt into ProseMirror, clicks "Start generation",
+// then polls the tile grid for a new completed image.
 
-async function getDynamicSiteKey(tabId) {
-  if (cachedRecaptchaKey) return cachedRecaptchaKey;
+async function generateImage(tabId, projectId, prompt, settings) {
+  const timeoutMs = 5 * 60 * 1000; // 5 minutes
 
   const result = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: () => {
-      // 1. Inspect script tags for the reCAPTCHA render parameter
-      const scripts = Array.from(document.querySelectorAll("script"));
-      for (const script of scripts) {
-        const match = (script.src || "").match(/recaptcha\/enterprise\.js\?render=([A-Za-z0-9_-]+)/);
-        if (match) return match[1];
+    func: async (promptText, timeoutMs) => {
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+      // ---- DOM helpers ----
+      function getPromptBox() {
+        const boxes = Array.from(document.querySelectorAll('.base-prompt-box'));
+        return boxes.find(el => el.offsetParent !== null && el.getClientRects().length > 0) ||
+               boxes[0] || null;
       }
-      // 2. We could add more scraping logic here if Google obfuscates it
-      return null;
-    }
-  }).catch(() => null);
-
-  let key = result?.[0]?.result;
-  
-  // Fallback to the last known working key if we couldn't find it
-  if (!key) {
-    key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
-  }
-  
-  cachedRecaptchaKey = key;
-  return key;
-}
-
-// ---- Get reCAPTCHA token from the page ----
-
-async function getRecaptchaToken(tabId, action = "IMAGE_GENERATION") {
-  const siteKey = await getDynamicSiteKey(tabId);
-
-  const result = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: (key, recaptchaAction) => {
-      const re = window.grecaptcha?.enterprise;
-      // In Chrome, returning a Promise from executeScript works correctly
-      return re ? re.execute(key, { action: recaptchaAction }) : Promise.resolve(null);
-    },
-    args: [siteKey, action]
-  }).catch(() => null);
-
-  return result?.[0]?.result || null;
-}
-
-// ---- Core API call (auth + recaptcha + fetch) ----
-
-async function callFlowAPI(tabId, url, body, action = "IMAGE_GENERATION", retryCount = 0) {
-  const authToken = await getAuthToken(tabId);
-  if (!authToken) throw new Error("No auth token — refresh the Flow page and try again.");
-
-  const recaptchaToken = await getRecaptchaToken(tabId, action);
-  if (!recaptchaToken) throw new Error("No reCAPTCHA token — refresh the Flow page and try again.");
-
-  // Inject the recaptcha token into the body
-  if (body.clientContext?.recaptchaContext) {
-    body.clientContext.recaptchaContext.token = recaptchaToken;
-  }
-  if (Array.isArray(body.requests)) {
-    for (const req of body.requests) {
-      if (req.clientContext?.recaptchaContext) {
-        req.clientContext.recaptchaContext.token = recaptchaToken;
+      function getEditor(box) {
+        box = box || getPromptBox();
+        return box?.querySelector('flow-rich-text-editor .ProseMirror[contenteditable="true"]') ||
+               box?.querySelector('.ProseMirror[contenteditable="true"]') || null;
       }
-    }
-  }
+      function getGenBtn(box) {
+        box = box || getPromptBox();
+        return box?.querySelector('button[aria-label="Start generation"]') ||
+               box?.querySelector('flow-generate-icon-button button[type="submit"]') || null;
+      }
+      function editorText(ed) {
+        ed = ed || getEditor();
+        if (!ed) return '';
+        const c = ed.cloneNode(true);
+        c.querySelectorAll('.prosemirror-placeholder, .ProseMirror-widget').forEach(n => n.remove());
+        return (c.innerText || c.textContent || '').replace(/\u00a0/g, ' ').trim();
+      }
+      function isOff(btn) {
+        return !btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true' ||
+               btn.classList.contains('mat-mdc-button-disabled');
+      }
+      const norm = s => s.replace(/\s+/g, ' ').trim().toLowerCase();
 
-  const bodyStr = JSON.stringify(body);
-
-  const result = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: async (fetchUrl, fetchBody, token, timeout) => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeout);
-      try {
-        const response = await fetch(fetchUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Authorization": "Bearer " + token
-          },
-          body: fetchBody,
-          signal: controller.signal
-        });
-        clearTimeout(timer);
-        const text = await response.text();
-        if (!response.ok) {
-          return { error: "HTTP " + response.status, status: response.status, errText: text.substring(0, 500) };
+      // ---- Clear the editor ----
+      async function clearEditor() {
+        const clrBtn = getPromptBox()?.querySelector('button[aria-label="Clear prompt"]');
+        if (clrBtn) { clrBtn.click(); await sleep(300); }
+        const ed = getEditor();
+        if (ed && editorText(ed)) {
+          ed.focus();
+          try {
+            const sel = window.getSelection(), range = document.createRange();
+            range.selectNodeContents(ed); sel.removeAllRanges(); sel.addRange(range);
+            document.execCommand('delete', false, null);
+          } catch (e) {}
+          await sleep(150);
         }
-        let data;
-        try { data = JSON.parse(text); } catch { data = text; }
-        return { success: true, data };
+        // Remove any ingredient chips
+        for (let i = 0; i < 12; i++) {
+          const chip = getPromptBox()?.querySelector('flow-ingredient-bar button.chip-container');
+          if (!chip) break;
+          const icon = chip.querySelector('.hover-icon-overlay, mat-icon');
+          (icon || chip).click();
+          await sleep(200);
+        }
+      }
+
+      // ---- Type into ProseMirror ----
+      async function typePrompt(text) {
+        await clearEditor();
+        const ed = getEditor();
+        if (!ed) return false;
+        ed.focus();
+        try {
+          const sel = window.getSelection(), range = document.createRange();
+          range.selectNodeContents(ed); range.collapse(false);
+          sel.removeAllRanges(); sel.addRange(range);
+        } catch (e) {}
+
+        // Method 1: clipboard paste
+        const dt = new DataTransfer();
+        dt.setData('text/plain', text);
+        ed.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+        await sleep(300);
+        if (norm(editorText()) === norm(text)) return true;
+
+        // Method 2: execCommand
+        await clearEditor(); getEditor()?.focus();
+        try { document.execCommand('insertText', false, text); } catch (e) {}
+        await sleep(300);
+        if (norm(editorText()) === norm(text)) return true;
+
+        // Method 3: InputEvent
+        await clearEditor(); const ed3 = getEditor(); ed3?.focus();
+        try {
+          ed3.dispatchEvent(new InputEvent('beforeinput', {
+            inputType: 'insertText', data: text, bubbles: true, cancelable: true
+          }));
+        } catch (e) {}
+        await sleep(300);
+        return norm(editorText()) === norm(text);
+      }
+
+      // ---- Tile helpers ----
+      function resultTiles() {
+        return Array.from(document.querySelectorAll('flow-grid-tile-container'))
+          .filter(el => !el.querySelector('flow-collection-tile'));
+      }
+      function pendingTiles() {
+        return Array.from(document.querySelectorAll('flow-pending-tile'));
+      }
+      function parseTile(tile) {
+        const img = tile.querySelector('img[data-media-id], img.image, img.thumbnail, img');
+        const vid = tile.querySelector('video');
+        const isPending = !!tile.querySelector('flow-pending-tile');
+        const mediaId = img?.getAttribute('data-media-id') || '';
+        const src = img?.src || vid?.src || '';
+        return { isPending, mediaId, src };
+      }
+
+      // ============ MAIN FLOW ============
+      try {
+        if (!getEditor()) return { success: false, error: 'Prompt editor not found — is a Flow project open?' };
+
+        // 1. Snapshot existing tile IDs
+        const existingIds = new Set(
+          resultTiles().map(parseTile)
+            .filter(t => !t.isPending && (t.mediaId || t.src))
+            .map(t => t.mediaId || t.src)
+        );
+
+        // 2. Type the prompt
+        if (!await typePrompt(promptText)) {
+          return { success: false, error: 'Could not type prompt into the Flow editor' };
+        }
+
+        // 3. Wait for the Generate button to become enabled
+        let btn = null;
+        for (let i = 0; i < 25; i++) {
+          btn = getGenBtn();
+          if (btn && !isOff(btn)) break;
+          await sleep(200);
+        }
+        if (!btn || isOff(btn)) {
+          return { success: false, error: 'Generate button is disabled or not found' };
+        }
+
+        // 4. Click Generate
+        btn.click();
+        await sleep(500);
+
+        // 5. Wait for generation to start (pending tiles appear or prompt clears)
+        let started = false;
+        for (let i = 0; i < 30; i++) {
+          if (pendingTiles().length > 0) { started = true; break; }
+          if (!editorText() && isOff(getGenBtn())) { started = true; break; }
+          await sleep(200);
+        }
+        if (!started) {
+          // Retry click
+          const btn2 = getGenBtn();
+          if (btn2 && !isOff(btn2)) { btn2.click(); await sleep(1000); }
+        }
+
+        // 6. Poll for completion
+        const deadline = Date.now() + timeoutMs;
+        let sawPending = false;
+
+        while (Date.now() < deadline) {
+          const pending = pendingTiles();
+
+          // Check for generation failures inside pending tiles
+          for (const pt of pending) {
+            const txt = (pt.innerText || '').toLowerCase();
+            if (/fail|error|couldn|could not|try again|blocked|violat|unsafe|not allowed|policy/.test(txt)) {
+              return { success: false, error: 'Generation failed: ' + txt.substring(0, 160) };
+            }
+          }
+
+          // Check toast/snackbar errors
+          const toasts = Array.from(document.querySelectorAll('[role="alert"], .mat-mdc-snack-bar-container, mat-snack-bar-container'))
+            .filter(el => el.offsetParent !== null)
+            .map(el => (el.innerText || '').toLowerCase().trim()).filter(Boolean);
+          const rl = toasts.find(t => /rate limit|too many|try again later|quota|limit reached/.test(t));
+          if (rl) return { success: false, error: 'Rate limited: ' + rl.substring(0, 160) };
+          const blocked = toasts.find(t => /unusual activity/.test(t));
+          if (blocked) return { success: false, error: 'Account blocked: ' + blocked.substring(0, 160) };
+
+          if (pending.length > 0) sawPending = true;
+
+          // Look for new completed tiles
+          const newTiles = resultTiles().map(parseTile)
+            .filter(t => !t.isPending && (t.mediaId || t.src) && !existingIds.has(t.mediaId || t.src));
+
+          if (newTiles.length > 0 && (pending.length === 0 || sawPending)) {
+            return { success: true, imageUrl: newTiles[0].src, mediaId: newTiles[0].mediaId };
+          }
+
+          await sleep(500);
+        }
+
+        return { success: false, error: 'Generation timed out after ' + Math.round(timeoutMs / 1000) + 's' };
       } catch (e) {
-        clearTimeout(timer);
-        return { error: e.name === "AbortError" ? "Request timed out" : e.message, isTimeout: e.name === "AbortError" };
+        return { success: false, error: e.message || String(e) };
       }
     },
-    args: [url, bodyStr, authToken, 60000]
+    args: [prompt, timeoutMs]
   }).catch(() => null);
 
   const response = result?.[0]?.result;
   if (!response) throw new Error("Flow tab lost — is it still open?");
+  if (!response.success) throw new Error(response.error);
 
-  if (response.error) {
-    if (response.status === 403 && retryCount === 0) {
-      await sleep(1500);
-      cachedToken = null;
-      return callFlowAPI(tabId, url, body, action, 1);
-    }
-    if (response.status === 429 || response.errText?.includes("RESOURCE_EXHAUSTED")) {
-      if (retryCount === 0) {
-        broadcast("BATCH_PROGRESS", { status: "waiting", message: "⚠️ Rate limited (429). Pausing pipeline for 30s before retrying..." });
-        await sleep(30000);
-        return callFlowAPI(tabId, url, body, action, 1);
-      }
-      throw new Error("Daily quota reached — try a different model or wait until tomorrow.");
-    }
-    if (response.status === 400) {
-      let msg = "Bad request";
-      try {
-        const parsed = JSON.parse(response.errText);
-        msg = parsed?.error?.message || parsed?.message || response.errText.substring(0, 200);
-      } catch {
-        msg = response.errText?.substring(0, 200) || "Unknown";
-      }
-      throw new Error("Rejected (400): " + msg);
-    }
-    if ((response.isTimeout || response.status >= 500) && retryCount === 0) {
-      await sleep(3000);
-      return callFlowAPI(tabId, url, body, action, 1);
-    }
-    throw new Error(response.error);
-  }
-
-  return response.data;
-}
-
-// ---- Generate a single image ----
-
-async function generateImage(tabId, projectId, prompt, settings) {
-  const url = `https://aisandbox-pa.googleapis.com/v1/projects/${projectId}/flowMedia:batchGenerateImages`;
-  const batchId = generateUUID();
-  const sessionId = ";" + Date.now() + Math.random().toString(36).slice(2);
-  const modelName = settings.model || "NARWHAL";
-
-  const requestBody = {
-    clientContext: {
-      recaptchaContext: {
-        applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB",
-        token: "PLACEHOLDER"
-      },
-      projectId: projectId,
-      tool: "PINHOLE",
-      sessionId: sessionId
-    },
-    mediaGenerationContext: { batchId },
-    useNewMedia: true,
-    requests: [{
-      clientContext: {
-        recaptchaContext: {
-          applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB",
-          token: "PLACEHOLDER"
-        },
-        projectId: projectId,
-        tool: "PINHOLE",
-        sessionId: sessionId
-      },
-      imageAspectRatio: settings.aspectRatio || "IMAGE_ASPECT_RATIO_LANDSCAPE",
-      imageInputs: [],
-      imageModelName: modelName,
-      seed: randomSeed(),
-      structuredPrompt: {
-        parts: [{ text: prompt }]
-      }
-    }]
-  };
-
-  const data = await callFlowAPI(tabId, url, requestBody);
-
-  console.log("=== FLOW API RESPONSE DATA ===");
-  console.log(JSON.stringify(data, null, 2));
-
-  let mediaId = null;
-  if (data?.workflows) {
-    for (const w of data.workflows) {
-      const id = w?.metadata?.primaryMediaId;
-      if (id) { mediaId = id; break; }
-    }
-  }
-  if (!mediaId && data?.media) {
-    for (const m of data.media) {
-      const id = m?.name || m?.mediaId;
-      if (id) { mediaId = id; break; }
-    }
-  }
-  if (!mediaId) throw new Error("No mediaId returned from generation.");
-
-  return mediaId;
+  return response.imageUrl;
 }
 
 // ---- Download an image as PNG (Chrome-native approach) ----
 
-async function downloadImage(tabId, mediaId, filename) {
-  const mediaUrl = `https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=${mediaId}`;
-
-  // Fetch image as blob directly in the main world context to bypass CORS/canvas restrictions (with retry logic)
+async function downloadImage(tabId, imageUrl, filename) {
   const result = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
@@ -348,51 +306,29 @@ async function downloadImage(tabId, mediaId, filename) {
         try {
           const response = await fetch(url);
           if (response.status === 429) {
-            if (attempt < retries - 1) {
-              await wait(delay);
-              delay *= 2; // Exponential backoff (2s, 4s, 8s)
-              continue;
-            }
-            throw new Error("HTTP error! status: 429 (Rate limit exceeded after retries)");
+            if (attempt < retries - 1) { await wait(delay); delay *= 2; continue; }
+            throw new Error("Rate limit exceeded after retries");
           }
-          if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-          }
+          if (!response.ok) throw new Error("HTTP " + response.status);
           const blob = await response.blob();
-          
-          const headersObj = {};
-          for (const [key, val] of response.headers.entries()) {
-            headersObj[key] = val;
-          }
-          
-          return { blobUrl: URL.createObjectURL(blob), size: blob.size, debugHeaders: headersObj, debugUrl: response.url };
+          return { blobUrl: URL.createObjectURL(blob), size: blob.size };
         } catch (e) {
-          if (attempt === retries - 1) {
-            return { error: e.message };
-          }
+          if (attempt === retries - 1) return { error: e.message };
           await wait(delay);
           delay *= 2;
         }
       }
     },
-    args: [mediaUrl]
+    args: [imageUrl]
   }).catch(() => null);
 
   const imgResult = result?.[0]?.result;
-  
-  console.log("=== IMAGE DOWNLOAD HEADERS ===");
-  console.log("Final URL:", imgResult?.debugUrl);
-  console.log("Headers:", JSON.stringify(imgResult?.debugHeaders, null, 2));
-  
   if (!imgResult?.blobUrl) {
     throw new Error("Download failed: " + (imgResult?.error || "unknown"));
   }
 
-  // Register the desired filename BEFORE starting the download
-  // so onDeterminingFilename can enforce it (no race condition)
   pendingFilenames.set(imgResult.blobUrl, filename);
 
-  // Chrome supports blob URL downloads natively — save to Flow_Images/ folder
   await new Promise((resolve, reject) => {
     chrome.downloads.download({
       url: imgResult.blobUrl,
@@ -405,7 +341,7 @@ async function downloadImage(tabId, mediaId, filename) {
     });
   });
 
-  // Clean up the blob URL
+  // Clean up blob URL
   chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
