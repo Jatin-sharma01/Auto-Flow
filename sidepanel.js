@@ -11,7 +11,6 @@ const exportBtn = document.getElementById("exportBtn");
 const importBtn = document.getElementById("importBtn");
 const importFileInput = document.getElementById("importFileInput");
 const promptList = document.getElementById("promptList");
-const variablesList = document.getElementById("variablesList");
 const logContainer = document.getElementById("logContainer");
 const summary = document.getElementById("summary");
 const statusDot = document.getElementById("statusDot");
@@ -21,15 +20,72 @@ const fileInput = document.getElementById("fileInput");
 const promptCount = document.getElementById("promptCount");
 const delaySlider = document.getElementById("delaySlider");
 const delayVal = document.getElementById("delayVal");
+const formatSelect = document.getElementById("formatSelect");
+const batchToggle = document.getElementById("batchToggle");
+const batchSliderRow = document.getElementById("batchSliderRow");
+const batchSlider = document.getElementById("batchSlider");
+const batchVal = document.getElementById("batchVal");
 const regenerateTitle = document.getElementById("regenerateTitle");
 const regenerateTags = document.getElementById("regenerateTags");
 const regenerateBtn = document.getElementById("regenerateBtn");
+
+// ---- Batch Toggle & Sliders ----
+if (batchToggle) {
+  batchToggle.addEventListener("change", (e) => {
+    if (batchSliderRow) batchSliderRow.style.display = e.target.checked ? "block" : "none";
+  });
+}
+
+if (batchSlider) {
+  batchSlider.addEventListener("input", (e) => {
+    if (batchVal) batchVal.textContent = e.target.value;
+  });
+}
 
 // ---- Delay Slider ----
 if (delaySlider) {
   delaySlider.addEventListener("input", (e) => {
     if (delayVal) delayVal.textContent = e.target.value;
   });
+}
+
+function getSettings() {
+  const delaySec = parseInt(delaySlider?.value, 10) || 2;
+  const isBatch = batchToggle?.checked || false;
+  const batchSize = isBatch ? (parseInt(batchSlider?.value, 10) || 2) : 1;
+  return {
+    model: document.getElementById("modelSelect")?.value || "NARWHAL",
+    aspectRatio: document.getElementById("aspectSelect")?.value || "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    fileNaming: document.getElementById("namingSelect")?.value || "number",
+    conflictAction: document.getElementById("conflictSelect")?.value || "overwrite",
+    format: formatSelect?.value || "jpeg",
+    folder: document.getElementById("folderInput")?.value?.trim() || "Flow_Images",
+    delay: delaySec,
+    batchSize
+  };
+}
+
+function restoreSettings(settings) {
+  if (!settings) return;
+  if (settings.model) document.getElementById("modelSelect").value = settings.model;
+  if (settings.aspectRatio) document.getElementById("aspectSelect").value = settings.aspectRatio;
+  if (settings.fileNaming) document.getElementById("namingSelect").value = settings.fileNaming;
+  if (settings.conflictAction) document.getElementById("conflictSelect").value = settings.conflictAction;
+  if (settings.format && formatSelect) formatSelect.value = settings.format;
+  if (settings.folder) document.getElementById("folderInput").value = settings.folder;
+  if (settings.delay) {
+    if (delaySlider) delaySlider.value = settings.delay;
+    if (delayVal) delayVal.textContent = settings.delay;
+  }
+  if (settings.batchSize > 1) {
+    if (batchToggle) batchToggle.checked = true;
+    if (batchSliderRow) batchSliderRow.style.display = "block";
+    if (batchSlider) batchSlider.value = settings.batchSize;
+    if (batchVal) batchVal.textContent = settings.batchSize;
+  } else {
+    if (batchToggle) batchToggle.checked = false;
+    if (batchSliderRow) batchSliderRow.style.display = "none";
+  }
 }
 
 // ---- Prompt counter ----
@@ -123,16 +179,7 @@ startBtn.addEventListener("click", () => {
     return;
   }
 
-  const delaySec = parseInt(document.getElementById("delaySlider")?.value, 10) || 2;
-  const settings = {
-    model: document.getElementById("modelSelect").value,
-    aspectRatio: document.getElementById("aspectSelect").value,
-    fileNaming: document.getElementById("namingSelect").value,
-    conflictAction: document.getElementById("conflictSelect").value,
-    folder: document.getElementById("folderInput").value.trim() || "Flow_Images",
-    delay: delaySec,
-    variablesText: variablesList.value
-  };
+  const settings = getSettings();
 
   // Clear previous log
   logContainer.innerHTML = "";
@@ -299,16 +346,7 @@ regenerateBtn.addEventListener("click", () => {
   regenerateBtn.style.display = "none";
   promptList.disabled = true;
 
-  const delaySec = parseInt(document.getElementById("delaySlider")?.value, 10) || 2;
-  const settings = {
-    model: document.getElementById("modelSelect").value,
-    aspectRatio: document.getElementById("aspectSelect").value,
-    fileNaming: document.getElementById("namingSelect").value,
-    conflictAction: document.getElementById("conflictSelect").value,
-    folder: document.getElementById("folderInput").value.trim() || "Flow_Images",
-    delay: delaySec,
-    variablesText: variablesList.value
-  };
+  const settings = getSettings();
 
   chrome.runtime.sendMessage({ type: "REGENERATE_SELECTED", nums: selected, settings });
 });
@@ -388,20 +426,7 @@ importFileInput.addEventListener("change", (e) => {
           updatePromptCount();
 
           // Restore settings
-          if (manifest.settings) {
-            if (manifest.settings.model) document.getElementById("modelSelect").value = manifest.settings.model;
-            if (manifest.settings.aspectRatio) document.getElementById("aspectSelect").value = manifest.settings.aspectRatio;
-            if (manifest.settings.fileNaming) document.getElementById("namingSelect").value = manifest.settings.fileNaming;
-            if (manifest.settings.conflictAction) document.getElementById("conflictSelect").value = manifest.settings.conflictAction;
-            if (manifest.settings.folder) document.getElementById("folderInput").value = manifest.settings.folder;
-            if (manifest.settings.delay) {
-              const el = document.getElementById("delaySlider");
-              if (el) el.value = manifest.settings.delay;
-              const valEl = document.getElementById("delayVal");
-              if (valEl) valEl.textContent = manifest.settings.delay;
-            }
-            if (manifest.settings.variablesText) variablesList.value = manifest.settings.variablesText;
-          }
+          restoreSettings(manifest.settings);
 
           // Show status
           const done = manifest.prompts.filter(p => p.status === "done").length;
@@ -444,7 +469,6 @@ importFileInput.addEventListener("change", (e) => {
 clearBtn.addEventListener("click", () => {
   if (confirm("Are you sure you want to clear all prompts and reset progress?")) {
     promptList.value = "";
-    variablesList.value = "";
     updatePromptCount();
     logContainer.innerHTML = "";
     logContainer.classList.remove("visible");
@@ -477,20 +501,7 @@ chrome.storage.local.get(['manifest'], (data) => {
   updatePromptCount();
 
   // Restore settings
-  if (manifest.settings) {
-    if (manifest.settings.model) document.getElementById("modelSelect").value = manifest.settings.model;
-    if (manifest.settings.aspectRatio) document.getElementById("aspectSelect").value = manifest.settings.aspectRatio;
-    if (manifest.settings.fileNaming) document.getElementById("namingSelect").value = manifest.settings.fileNaming;
-    if (manifest.settings.conflictAction) document.getElementById("conflictSelect").value = manifest.settings.conflictAction;
-    if (manifest.settings.folder) document.getElementById("folderInput").value = manifest.settings.folder;
-    if (manifest.settings.delay) {
-      const el = document.getElementById("delaySlider");
-      if (el) el.value = manifest.settings.delay;
-      const valEl = document.getElementById("delayVal");
-      if (valEl) valEl.textContent = manifest.settings.delay;
-    }
-    if (manifest.settings.variablesText) variablesList.value = manifest.settings.variablesText;
-  }
+  restoreSettings(manifest.settings);
 
   // Show status
   summary.classList.add("visible");

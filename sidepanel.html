@@ -412,9 +412,32 @@
   </div>
 
   <div class="row">
-    <div style="width: 100%; margin-bottom: 16px;">
+    <div>
+      <select id="formatSelect">
+        <option value="jpeg" selected>🖼️ Format: JPEG</option>
+        <option value="png">🎨 Format: PNG</option>
+      </select>
+    </div>
+    <div>
       <input type="text" id="folderInput" value="Flow_Images" placeholder="Save Folder Name" style="margin-bottom: 0;" />
     </div>
+  </div>
+
+  <div class="row" style="margin-top: 12px; margin-bottom: 12px;">
+    <div style="flex: 1;">
+      <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; color: #c9d1d9; user-select: none;">
+        <input type="checkbox" id="batchToggle" style="cursor: pointer; width: 16px; height: 16px;">
+        <span>⚡ Turn On Batch Mode</span>
+      </label>
+    </div>
+  </div>
+
+  <div id="batchSliderRow" style="display: none; margin-bottom: 16px;">
+    <div class="section-title" style="display: flex; justify-content: space-between;">
+      <span>Batch Size (Concurrent)</span>
+      <span><span id="batchVal">2</span></span>
+    </div>
+    <input type="range" id="batchSlider" min="2" max="5" value="2" style="width: 100%;">
   </div>
 
   <div class="row">
@@ -426,10 +449,6 @@
       <input type="range" id="delaySlider" min="1" max="10" value="2" style="width: 100%;">
     </div>
   </div>
-
-  <!-- Variables -->
-  <div class="section-title">Variables (Optional)</div>
-  <textarea id="variablesList" placeholder="[noesis] = a stick figure...&#10;[elder] = an old man..." style="height: 80px; margin-bottom: 16px;"></textarea>
 
   <!-- Action Buttons -->
   <button class="btn btn-start" id="startBtn">🚀 Start Generating</button>
