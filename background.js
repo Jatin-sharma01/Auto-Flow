@@ -1,6 +1,6 @@
 // ============================================================
 // Auto Flow - Chrome/Chromium Version (Background Service Worker)
-// Uses DOM automation (typing + clicking) to interact with Flow.
+// Uses DOM automation + Chrome DevTools Protocol (CDP) for trusted actions.
 // ============================================================
 
 let stopRequested = false;
@@ -10,22 +10,19 @@ let stopRequested = false;
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
 // ---- Download filename enforcement ----
-// Chrome ignores the `filename` and `conflictAction` params for blob URL downloads.
-// This listener intercepts the download and forces the correct filename and conflict action.
-const pendingDownloads = new Map(); // blobUrl -> { filename, conflictAction }
+// Chrome ignores the `filename` param for blob URL downloads.
+// This listener intercepts the download and forces the correct filename & conflictAction.
+const pendingFilenames = new Map();
 
 chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
-  const pending = pendingDownloads.get(downloadItem.url);
+  const pending = pendingFilenames.get(downloadItem.url);
   if (pending) {
-    pendingDownloads.delete(downloadItem.url);
-    suggest({
-      filename: pending.filename,
-      conflictAction: pending.conflictAction || "uniquify"
-    });
+    pendingFilenames.delete(downloadItem.url);
+    const filename = typeof pending === "string" ? pending : pending.filename;
+    const conflictAction = (typeof pending === "object" && pending.conflictAction) ? pending.conflictAction : "overwrite";
+    suggest({ filename, conflictAction });
   }
 });
-
-
 
 // ---- Utilities ----
 
@@ -39,6 +36,19 @@ function sanitizeFilename(text) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .substring(0, 40) || "image";
+}
+
+function isFlowUrl(url) {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "flow.google.com" || host.endsWith(".flow.google.com")) return true;
+    if (host.endsWith("labs.google") && (parsed.pathname.includes("/flow") || parsed.hash.includes("/flow"))) return true;
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 // ---- Send progress to side panel ----
@@ -66,12 +76,25 @@ async function findFlowTab() {
 
 // ---- Get project ID from the Flow URL ----
 
-async function getProjectId(tabId) {
+function extractProjectIdFromUrl(url) {
+  if (!url) return null;
+  const match = url.match(/projects?\/([a-zA-Z0-9_-]+)/i) || 
+                url.match(/[?&]project(?:Id)?=([a-zA-Z0-9_-]+)/i);
+  return match ? match[1] : null;
+}
+
+async function getProjectId(tab) {
+  if (tab?.url) {
+    const fromUrl = extractProjectIdFromUrl(tab.url);
+    if (fromUrl) return fromUrl;
+  }
+  const tabId = typeof tab === "object" ? tab.id : tab;
   const result = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
     func: () => {
-      const match = window.location.href.match(/project\/([a-f0-9-]+)/);
+      const match = window.location.href.match(/projects?\/([a-zA-Z0-9_-]+)/i) ||
+                    window.location.href.match(/[?&]project(?:Id)?=([a-zA-Z0-9_-]+)/i);
       return match ? match[1] : null;
     }
   }).catch(() => null);
@@ -253,7 +276,7 @@ async function submitPrompt(tabId, promptText) {
 
 // ---- Download an image with optional PNG conversion ----
 
-async function downloadImage(tabId, imageUrl, filename, conflictAction, format = "jpeg") {
+async function downloadImage(tabId, imageUrl, filename, conflictAction = "overwrite", format = "jpeg") {
   const result = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
@@ -296,40 +319,50 @@ async function downloadImage(tabId, imageUrl, filename, conflictAction, format =
     throw new Error("Download failed: " + (imgResult?.error || "unknown"));
   }
 
-  pendingDownloads.set(imgResult.blobUrl, { filename, conflictAction: conflictAction || "uniquify" });
+  const effectiveConflict = (conflictAction === "prompt") ? "uniquify" : (conflictAction || "overwrite");
+  pendingFilenames.set(imgResult.blobUrl, { filename, conflictAction: effectiveConflict });
 
   await new Promise((resolve, reject) => {
     chrome.downloads.download({
       url: imgResult.blobUrl,
       filename: filename,
-      saveAs: false,
-      conflictAction: conflictAction || "uniquify"
+      saveAs: (conflictAction === "prompt"),
+      conflictAction: effectiveConflict
     }, (downloadId) => {
       if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
       resolve(downloadId);
     });
   });
 
-  chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: (url) => URL.revokeObjectURL(url),
-    args: [imgResult.blobUrl]
-  }).catch(() => {});
+  setTimeout(() => {
+    chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: (url) => URL.revokeObjectURL(url),
+      args: [imgResult.blobUrl]
+    }).catch(() => {});
+  }, 15000);
 }
 
 // ---- Manifest Helpers ----
 
 function buildManifest(prompts, settings) {
+  const startIndex = parseInt(settings?.startIndex || "1", 10) || 1;
+  const endIndex = parseInt(settings?.endIndex || "", 10) || prompts.length;
+
   return {
     version: 1,
     createdAt: new Date().toISOString(),
     settings,
-    prompts: prompts.map((prompt, i) => ({
-      imageNum: i + 1,
-      prompt,
-      status: "pending"
-    }))
+    prompts: prompts.map((prompt, i) => {
+      const absoluteLineNum = i + 1;
+      const inRange = absoluteLineNum >= startIndex && absoluteLineNum <= endIndex;
+      return {
+        imageNum: absoluteLineNum,
+        prompt,
+        status: inRange ? "pending" : "skipped"
+      };
+    })
   };
 }
 
@@ -337,45 +370,74 @@ function saveManifest(manifest) {
   chrome.storage.local.set({ manifest });
 }
 
+function applyVariables(prompt, variables) {
+  if (!variables || Object.keys(variables).length === 0) return prompt;
+  let result = prompt;
+  for (const [key, value] of Object.entries(variables)) {
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`\\[${escapedKey}\\]`, 'gi');
+    result = result.replace(regex, value);
+  }
+  return result;
+}
+
+function parseVariables(variablesText) {
+  const variables = {};
+  if (variablesText && variablesText.trim() !== "") {
+    const lines = variablesText.split("\n");
+    for (const line of lines) {
+      const match = line.match(/^\[(.*?)\]\s*=\s*(.*)$/);
+      if (match) {
+        variables[match[1].trim().toLowerCase()] = match[2].trim();
+      }
+    }
+  }
+  return variables;
+}
+
 function getFilename(imageNum, prompt, settings) {
-  const folder = sanitizeFilename(settings.folder || "Flow_Images");
+  const folder = sanitizeFilename(settings?.folder || "Flow_Images");
   const num = String(imageNum).padStart(3, "0");
-  const ext = (settings.format === "png") ? "png" : "jpg";
-  if (settings.fileNaming === "prompt") {
+  const ext = (settings?.format === "png") ? "png" : "jpg";
+
+  if (settings?.fileNaming === "prompt") {
     const promptSlug = sanitizeFilename(prompt).substring(0, 30);
     return `${folder}/${num}-${promptSlug}.${ext}`;
   }
   return `${folder}/${num}.${ext}`;
 }
 
-// ---- Process a list of manifest entries ----
+// ---- Processing Engine (Supports Sequential and Concurrent Batch Modes) ----
 
 async function processEntries(entries, manifest, settings, logPrefix = "") {
   const tab = await findFlowTab();
-  if (!tab?.id) {
-    broadcast("BATCH_ERROR", { message: "No Google Flow tab found. Open a Flow project first!" });
+  if (!tab) {
+    broadcast("BATCH_ERROR", { message: "Flow tab not found. Make sure labs.google/fx/tools/flow is open." });
     return;
   }
 
-  const projectId = await getProjectId(tab.id);
+  const projectId = await getProjectId(tab);
   if (!projectId) {
-    broadcast("BATCH_ERROR", { message: "No Flow project open. Create or open a project in Flow first!" });
+    broadcast("BATCH_ERROR", { message: "No active project found in Flow URL. Open a project first." });
     return;
   }
 
-  const delaySec = Math.max(1, parseInt(settings.delay, 10) || 2);
-  const batchSize = Math.max(1, Math.min(5, parseInt(settings.batchSize, 10) || 1));
+  const variables = parseVariables(settings?.variablesText);
+  const delaySec = parseInt(settings?.delaySec, 10) || 2;
+  const batchSize = Math.max(1, parseInt(settings?.batchSize, 10) || 1);
+  const conflictAction = settings?.conflictAction || "overwrite";
+  const format = settings?.format || "jpeg";
   const total = manifest.prompts.length;
   let completed = 0;
 
   broadcast("BATCH_STARTED", { total });
 
+  // Snapshot initial images currently on canvas
   const knownImages = new Set(await getAllCanvasImages(tab.id));
 
   if (batchSize <= 1) {
-    // --- Sequential Processing (Default: 1 image at a time) ---
+    // ---- Sequential Mode ----
     for (let i = 0; i < entries.length; i++) {
-      const entry = entries[i];
       if (stopRequested) {
         broadcast("BATCH_PROGRESS", { index: i, total, status: "stopped", message: "Stopped by user." });
         for (let j = i; j < entries.length; j++) {
@@ -385,20 +447,22 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
         break;
       }
 
-      const label = logPrefix ? `[${logPrefix} ${entry.imageNum}]` : `[${entry.imageNum}/${total}]`;
-      const prompt = entry.prompt;
+      const entry = entries[i];
+      const prompt = applyVariables(entry.prompt, variables);
+      const label = logPrefix ? `[${logPrefix} #${entry.imageNum}]` : `[#${entry.imageNum}/${total}]`;
+      const promptPreview = prompt.substring(0, 50) + (prompt.length > 50 ? "…" : "");
 
       broadcast("BATCH_PROGRESS", {
-        index: i, total, status: "generating",
-        message: `${label} Generating: "${prompt.substring(0, 50)}…"`
+        index: entry.imageNum - 1, total, status: "generating",
+        message: `${label} Submitting: "${promptPreview}"`
       });
 
       try {
         const submitRes = await submitPrompt(tab.id, prompt);
         if (!submitRes.success) throw new Error(submitRes.error || "Submission failed");
 
-        // Wait for image to generate
-        const deadline = Date.now() + 2 * 60 * 1000;
+        // Wait for newly generated image on canvas (up to 120s)
+        const deadline = Date.now() + 120 * 1000;
         let imageUrl = null;
         while (Date.now() < deadline) {
           if (stopRequested) break;
@@ -422,25 +486,34 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
           throw new Error("Generation timed out after 120s");
         }
 
-        broadcast("BATCH_PROGRESS", { index: i, total, status: "downloading", message: `${label} Downloading...` });
-        const filename = getFilename(entry.imageNum, prompt, settings);
+        broadcast("BATCH_PROGRESS", {
+          index: entry.imageNum - 1, total, status: "downloading",
+          message: `${label} Downloading...`
+        });
 
+        const filename = getFilename(entry.imageNum, prompt, settings);
         try {
-          await downloadImage(tab.id, imageUrl, filename, settings.conflictAction || "overwrite", settings.format || "jpeg");
+          await downloadImage(tab.id, imageUrl, filename, conflictAction, format);
           completed++;
           entry.status = "done";
           delete entry.error;
-          broadcast("BATCH_PROGRESS", { index: i, total, status: "done", message: `${label} ✅ Saved: ${filename}` });
+          broadcast("BATCH_PROGRESS", {
+            index: entry.imageNum - 1, total, status: "done",
+            message: `${label} ✅ Saved: ${filename}`
+          });
         } catch (dlErr) {
           entry.status = "failed";
           entry.error = "Download failed: " + dlErr.message;
-          broadcast("BATCH_PROGRESS", { index: i, total, status: "failed", message: `${label} ❌ ${entry.error}` });
+          broadcast("BATCH_PROGRESS", {
+            index: entry.imageNum - 1, total, status: "failed",
+            message: `${label} ❌ ${entry.error}`
+          });
         }
         saveManifest(manifest);
 
         if (i < entries.length - 1 && !stopRequested) {
           broadcast("BATCH_PROGRESS", {
-            index: i, total, status: "waiting",
+            index: entry.imageNum - 1, total, status: "waiting",
             message: `Waiting ${delaySec}s before next prompt...`
           });
           await sleep(delaySec * 1000);
@@ -450,7 +523,10 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
         entry.status = "failed";
         entry.error = err.message;
         saveManifest(manifest);
-        broadcast("BATCH_PROGRESS", { index: i, total, status: "failed", message: `${label} ❌ ${err.message}` });
+        broadcast("BATCH_PROGRESS", {
+          index: entry.imageNum - 1, total, status: "failed",
+          message: `${label} ❌ ${err.message}`
+        });
 
         const isFatal = /quota|auth|blocked|rate limit|403|unusual activity/i.test(err.message);
         if (isFatal) {
@@ -468,7 +544,7 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
       }
     }
   } else {
-    // --- Pipelined Batch Mode (batchSize > 1) ---
+    // ---- Pipelined Concurrent Batch Mode (batchSize > 1) ----
     const inFlight = [];
     let nextIndex = 0;
 
@@ -476,16 +552,19 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
       // Dispatch prompts up to batchSize with 2s safe spacing
       while (inFlight.length < batchSize && nextIndex < entries.length && !stopRequested) {
         const entry = entries[nextIndex++];
-        const label = logPrefix ? `[${logPrefix} ${entry.imageNum}]` : `[${entry.imageNum}/${total}]`;
+        const prompt = applyVariables(entry.prompt, variables);
+        const label = logPrefix ? `[${logPrefix} #${entry.imageNum}]` : `[#${entry.imageNum}/${total}]`;
+        const promptPreview = prompt.substring(0, 50) + (prompt.length > 50 ? "…" : "");
+
         broadcast("BATCH_PROGRESS", {
           index: entry.imageNum - 1, total, status: "generating",
-          message: `${label} Submitting: "${entry.prompt.substring(0, 50)}…"`
+          message: `${label} Submitting: "${promptPreview}"`
         });
 
         try {
-          const submitRes = await submitPrompt(tab.id, entry.prompt);
+          const submitRes = await submitPrompt(tab.id, prompt);
           if (!submitRes.success) throw new Error(submitRes.error || "Submission failed");
-          inFlight.push({ entry, prompt: entry.prompt, label, startTime: Date.now() });
+          inFlight.push({ entry, prompt, label, startTime: Date.now() });
           broadcast("BATCH_PROGRESS", {
             index: entry.imageNum - 1, total, status: "generating",
             message: `${label} Generating on canvas...`
@@ -496,7 +575,10 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
           entry.status = "failed";
           entry.error = subErr.message;
           saveManifest(manifest);
-          broadcast("BATCH_PROGRESS", { index: entry.imageNum - 1, total, status: "failed", message: `${label} ❌ ${subErr.message}` });
+          broadcast("BATCH_PROGRESS", {
+            index: entry.imageNum - 1, total, status: "failed",
+            message: `${label} ❌ ${subErr.message}`
+          });
         }
       }
 
@@ -527,19 +609,28 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
           const job = inFlight.shift();
           await scrollTileIntoView(tab.id, src);
 
-          broadcast("BATCH_PROGRESS", { index: job.entry.imageNum - 1, total, status: "downloading", message: `${job.label} Downloading...` });
+          broadcast("BATCH_PROGRESS", {
+            index: job.entry.imageNum - 1, total, status: "downloading",
+            message: `${job.label} Downloading...`
+          });
           const filename = getFilename(job.entry.imageNum, job.prompt, settings);
 
           try {
-            await downloadImage(tab.id, src, filename, settings.conflictAction || "overwrite", settings.format || "jpeg");
+            await downloadImage(tab.id, src, filename, conflictAction, format);
             completed++;
             job.entry.status = "done";
             delete job.entry.error;
-            broadcast("BATCH_PROGRESS", { index: job.entry.imageNum - 1, total, status: "done", message: `${job.label} ✅ Saved: ${filename}` });
+            broadcast("BATCH_PROGRESS", {
+              index: job.entry.imageNum - 1, total, status: "done",
+              message: `${job.label} ✅ Saved: ${filename}`
+            });
           } catch (dlErr) {
             job.entry.status = "failed";
             job.entry.error = "Download failed: " + dlErr.message;
-            broadcast("BATCH_PROGRESS", { index: job.entry.imageNum - 1, total, status: "failed", message: `${job.label} ❌ ${job.entry.error}` });
+            broadcast("BATCH_PROGRESS", {
+              index: job.entry.imageNum - 1, total, status: "failed",
+              message: `${job.label} ❌ ${job.entry.error}`
+            });
           }
           saveManifest(manifest);
         }
@@ -551,7 +642,10 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
         const timedOut = inFlight.shift();
         timedOut.entry.status = "failed";
         timedOut.entry.error = "Generation timed out after 120s";
-        broadcast("BATCH_PROGRESS", { index: timedOut.entry.imageNum - 1, total, status: "failed", message: `${timedOut.label} ❌ Timed out after 120s` });
+        broadcast("BATCH_PROGRESS", {
+          index: timedOut.entry.imageNum - 1, total, status: "failed",
+          message: `${timedOut.label} ❌ Timed out after 120s`
+        });
         saveManifest(manifest);
       }
     }
@@ -570,12 +664,12 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
   const failedNums = failedEntries.map(f => f.imageNum);
   const pendingNums = pendingEntries.map(p => p.imageNum);
 
-  broadcast("BATCH_DONE", {
-    completed,
+  broadcast("BATCH_COMPLETE", {
+    total: manifest.prompts.length,
+    completed: doneCount,
     doneCount,
     failed: failedEntries.length,
     pending: pendingEntries.length,
-    total: manifest.prompts.length,
     failedNums,
     pendingNums
   });
@@ -585,67 +679,97 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
   }
 }
 
-// ---- Batch Processing ----
+// ---- Run Batch ----
 
 async function runBatch(config) {
-  const { prompts, settings } = config;
   stopRequested = false;
+  const { prompts, settings } = config;
 
-  // Build or resume manifest
   let manifest;
   if (config.manifest) {
-    // Imported or resumed manifest
     manifest = config.manifest;
-    if (settings) {
-      manifest.settings = { ...manifest.settings, ...settings };
-      saveManifest(manifest);
-    }
+    manifest.settings = { ...manifest.settings, ...settings };
+
+    const startIndex = parseInt(settings?.startIndex || "1", 10) || 1;
+    const endIndex = parseInt(settings?.endIndex || "", 10) || manifest.prompts.length;
+
+    manifest.prompts = manifest.prompts.map((p) => {
+      const inRange = p.imageNum >= startIndex && p.imageNum <= endIndex;
+      if (inRange) {
+        if (p.status !== "done") {
+          p.status = "pending";
+        }
+      } else {
+        if (p.status !== "done") {
+          p.status = "skipped";
+        }
+      }
+      return p;
+    });
+
+    saveManifest(manifest);
   } else {
     manifest = buildManifest(prompts, settings);
     saveManifest(manifest);
   }
 
-  // Process only pending entries
   const pendingEntries = manifest.prompts.filter(p => p.status === "pending");
   if (pendingEntries.length === 0) {
-    broadcast("BATCH_ERROR", { message: "No pending images to generate." });
+    const doneCount = manifest.prompts.filter(p => p.status === "done").length;
+    broadcast("BATCH_COMPLETE", {
+      total: manifest.prompts.length,
+      completed: doneCount,
+      doneCount,
+      failed: 0,
+      pending: 0,
+      failedNums: [],
+      pendingNums: []
+    });
     return;
   }
 
-  await processEntries(pendingEntries, manifest, manifest.settings);
+  await processEntries(pendingEntries, manifest, settings);
 }
 
-// ---- Retry Failed Images ----
+// ---- Retry Failed ----
 
 async function retryFailed(manifest) {
   stopRequested = false;
 
   const failedEntries = manifest.prompts.filter(p => p.status === "failed");
-  if (failedEntries.length === 0) {
-    broadcast("BATCH_ERROR", { message: "No failed images to retry." });
-    return;
-  }
+  failedEntries.forEach(p => {
+    p.status = "pending";
+    delete p.error;
+  });
+  saveManifest(manifest);
 
   await processEntries(failedEntries, manifest, manifest.settings, "Retry");
 }
 
-// ---- Message Handler ----
+// ---- Message listener ----
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "RUN_BATCH") {
-    sendResponse({ ok: true });
     runBatch(message).catch(err => {
       broadcast("BATCH_ERROR", { message: "Fatal error: " + err.message });
     });
     return false;
   }
 
+  if (message.type === "STOP_BATCH") {
+    stopRequested = true;
+    return false;
+  }
+
   if (message.type === "RETRY_FAILED") {
-    sendResponse({ ok: true });
     chrome.storage.local.get(['manifest'], (data) => {
       if (!data.manifest) {
         broadcast("BATCH_ERROR", { message: "No manifest found. Nothing to retry." });
         return;
+      }
+      if (message.settings) {
+        data.manifest.settings = { ...data.manifest.settings, ...message.settings };
+        saveManifest(data.manifest);
       }
       retryFailed(data.manifest).catch(err => {
         broadcast("BATCH_ERROR", { message: "Fatal error during retry: " + err.message });
@@ -654,40 +778,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
-  if (message.type === "EXPORT_MANIFEST") {
-    chrome.storage.local.get(['manifest'], (data) => {
-      sendResponse({ manifest: data.manifest || null });
-    });
-    return true; // async sendResponse
-  }
-
-  if (message.type === "IMPORT_MANIFEST") {
-    const manifest = message.manifest;
-    if (manifest && manifest.prompts) {
-      saveManifest(manifest);
-      sendResponse({ ok: true, pending: manifest.prompts.filter(p => p.status !== "done").length });
-    } else {
-      sendResponse({ ok: false, error: "Invalid manifest file." });
-    }
-    return false;
-  }
-
-  if (message.type === "STOP_BATCH") {
-    stopRequested = true;
-    sendResponse({ ok: true });
-    return false;
-  }
-
   if (message.type === "REGENERATE_SELECTED") {
     sendResponse({ ok: true });
     chrome.storage.local.get(['manifest'], (data) => {
       if (!data.manifest) return;
       const manifest = data.manifest;
-      
+
       if (message.settings) {
         manifest.settings = { ...manifest.settings, ...message.settings };
       }
-      
+
       const nums = new Set(message.nums);
       manifest.prompts.forEach(p => {
         if (nums.has(p.imageNum)) {
@@ -696,7 +796,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
       });
       saveManifest(manifest);
-      
+
       stopRequested = false;
       const pendingEntries = manifest.prompts.filter(p => nums.has(p.imageNum));
       processEntries(pendingEntries, manifest, manifest.settings, "Regenerate").catch(err => {
@@ -710,16 +810,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       try {
         const tab = await findFlowTab();
-        if (!tab) return sendResponse({ connected: false, reason: "No Flow tab open." });
-        const projectId = await getProjectId(tab.id);
-        if (!projectId) return sendResponse({ connected: false, reason: "No project open in Flow." });
+        if (!tab) return sendResponse({ connected: false, reason: "No Flow tab open. Open labs.google/fx/tools/flow first!" });
+        const projectId = await getProjectId(tab);
+        if (!projectId) return sendResponse({ connected: false, reason: "Flow tab found, but no project opened. Open or create a project!" });
         sendResponse({ connected: true, tabId: tab.id, projectId });
       } catch (e) {
         sendResponse({ connected: false, reason: e.message });
       }
     })();
-    return true;
+    return true; // Keep channel open for async response
   }
 
   return false;
+});
+
+// ---- Listen for tab changes to notify side panel ----
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "complete" || changeInfo.url) {
+    if (isFlowUrl(tab.url)) {
+      broadcast("CONNECTION_CHANGED", {});
+    }
+  }
+});
+
+chrome.tabs.onActivated.addListener(() => {
+  broadcast("CONNECTION_CHANGED", {});
 });

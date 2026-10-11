@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Auto Flow - Bulk MS Paint Generator",
-  "description": "Bulk generate and auto-download images from Google Labs Flow via direct API calls.",
-  "version": "1.0.0",
+  "description": "Bulk generate and auto-download images from Google Labs Flow via DOM automation.",
+  "version": "2.5.0",
   "permissions": [
     "activeTab",
     "storage",

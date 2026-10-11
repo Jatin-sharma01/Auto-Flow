@@ -1,18 +1,20 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
+  <title>Auto Flow</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
       width: 100%;
-      height: 100vh;
-      font-family: system-ui, -apple-system, sans-serif;
-      background: linear-gradient(180deg, #0d1117 0%, #161b22 100%);
-      color: #e6edf3;
+      min-height: 100vh;
       padding: 16px;
-      overflow-y: auto;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: #0f1117;
+      color: #e6edf3;
+      display: flex;
+      flex-direction: column;
     }
 
     /* Header */
@@ -20,33 +22,28 @@
       display: flex;
       align-items: center;
       gap: 10px;
-      margin-bottom: 20px;
-      padding-bottom: 16px;
-      border-bottom: 1px solid rgba(255,255,255,0.06);
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
     }
     .header-icon {
-      width: 36px;
-      height: 36px;
-      border-radius: 10px;
+      width: 28px;
+      height: 28px;
       background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      border-radius: 6px;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 20px;
-      flex-shrink: 0;
+      font-size: 14px;
     }
-    .header h1 {
-      font-size: 18px;
+    h1 {
+      font-size: 16px;
       font-weight: 700;
-      background: linear-gradient(90deg, #3b82f6, #8b5cf6, #ec4899);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
+      letter-spacing: -0.3px;
     }
-    .header small {
-      font-size: 11px;
+    small {
       color: #8b949e;
-      display: block;
-      margin-top: 2px;
+      font-size: 11px;
     }
 
     /* Connection status */
@@ -54,12 +51,12 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 10px 14px;
+      padding: 8px 12px;
       border-radius: 8px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.06);
       margin-bottom: 16px;
       font-size: 12px;
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.06);
     }
     .status-dot {
       width: 8px;
@@ -67,87 +64,94 @@
       border-radius: 50%;
       flex-shrink: 0;
     }
-    .status-dot.connected { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
-    .status-dot.disconnected { background: #ef4444; box-shadow: 0 0 6px #ef444488; }
-    .status-dot.checking { background: #eab308; animation: pulse 1s infinite; }
+    .status-dot.connected { background: #22c55e; box-shadow: 0 0 8px rgba(34,197,94,0.5); }
+    .status-dot.disconnected { background: #ef4444; box-shadow: 0 0 8px rgba(239,68,68,0.5); }
+    .status-dot.checking { background: #eab308; animation: pulse 1.5s infinite; }
 
-    /* Section titles */
+    /* Form elements */
     .section-title {
       font-size: 11px;
-      font-weight: 700;
-      color: #8b949e;
+      font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.5px;
+      color: #8b949e;
       margin-bottom: 6px;
     }
 
-    /* Form elements */
     textarea {
       width: 100%;
-      height: 180px;
-      background: rgba(255,255,255,0.03);
+      height: 120px;
+      background: rgba(255,255,255,0.04);
       border: 1px solid rgba(255,255,255,0.08);
       border-radius: 8px;
-      padding: 12px;
       color: #e6edf3;
-      font-family: 'SF Mono', 'Fira Code', monospace;
+      padding: 10px 12px;
       font-size: 12px;
-      line-height: 1.6;
+      font-family: inherit;
       resize: vertical;
-      margin-bottom: 16px;
       outline: none;
       transition: border-color 0.2s;
     }
-    textarea:focus { border-color: #3b82f680; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
-    textarea::placeholder { color: #484f58; }
-
-    input[type="text"] {
-      width: 100%;
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 8px;
-      padding: 9px 12px;
-      color: #e6edf3;
-      font-size: 13px;
-      margin-bottom: 16px;
-      outline: none;
-      transition: border-color 0.2s;
+    textarea:focus {
+      border-color: #3b82f6;
     }
-    input[type="text"]:focus { border-color: #3b82f680; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
-    input[type="text"]::placeholder { color: #484f58; }
-
-    select {
-      width: 100%;
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 8px;
-      padding: 9px 12px;
-      color: #e6edf3;
-      font-size: 13px;
-      margin-bottom: 16px;
-      outline: none;
-      cursor: pointer;
-      appearance: none;
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%238b949e' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E");
-      background-repeat: no-repeat;
-      background-position: right 12px center;
+    textarea::placeholder {
+      color: #484f58;
     }
-    select:focus { border-color: #3b82f680; }
-    option { background: #161b22; color: #e6edf3; }
 
     .row {
       display: flex;
-      gap: 10px;
+      gap: 8px;
+      margin-bottom: 12px;
     }
     .row > div { flex: 1; }
+
+    select, input[type="text"], input[type="number"] {
+      width: 100%;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 8px;
+      color: #e6edf3;
+      padding: 8px 10px;
+      font-size: 12px;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    select:focus, input[type="text"]:focus, input[type="number"]:focus {
+      border-color: #3b82f6;
+    }
+    select option {
+      background: #161b22;
+      color: #e6edf3;
+    }
+
+    input[type="range"] {
+      -webkit-appearance: none;
+      width: 100%;
+      height: 4px;
+      border-radius: 2px;
+      background: rgba(255,255,255,0.15);
+      outline: none;
+      margin-top: 8px;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #3b82f6;
+      cursor: pointer;
+      box-shadow: 0 0 6px rgba(59,130,246,0.5);
+    }
 
     /* Buttons */
     .btn {
       width: 100%;
-      padding: 12px;
+      padding: 10px;
       border: none;
       border-radius: 8px;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 700;
       cursor: pointer;
       transition: all 0.2s;
@@ -254,7 +258,7 @@
     /* Progress log */
     .log-container {
       margin-top: 16px;
-      max-height: 300px;
+      max-height: 280px;
       overflow-y: auto;
       border-radius: 8px;
       background: rgba(0,0,0,0.25);
@@ -326,6 +330,7 @@
     .tag.done { background: rgba(34,197,94,0.15); color: #22c55e; }
     .tag.failed { background: rgba(239,68,68,0.15); color: #ef4444; }
     .tag.pending { background: rgba(107,114,128,0.2); color: #9ca3af; }
+    .tag.skipped { background: rgba(107,114,128,0.1); color: #6b7280; font-style: italic; }
     .tag:hover { filter: brightness(1.2); }
     .tag.selected {
       border-color: #3b82f6;
@@ -346,7 +351,6 @@
     ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
     ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
 
-    /* Firefox scrollbar */
     * {
       scrollbar-width: thin;
       scrollbar-color: rgba(255,255,255,0.08) transparent;
@@ -406,7 +410,8 @@
     <div>
       <select id="conflictSelect">
         <option value="overwrite" selected>🔄 Overwrite (Clean Nums)</option>
-        <option value="uniquify">🆕 Keep both (Adds (1))</option>
+        <option value="uniquify">📑 Keep both (Adds (1))</option>
+        <option value="prompt">❓ Prompt each time</option>
       </select>
     </div>
   </div>
@@ -441,14 +446,28 @@
   </div>
 
   <div class="row">
-    <div style="width: 100%; margin-bottom: 16px;">
+    <div style="width: 100%; margin-bottom: 12px;">
       <div class="section-title" style="display: flex; justify-content: space-between;">
-        <span>Delay Between Prompts</span>
-        <span><span id="delayVal">2</span>s</span>
+        <span>Interval Delay (seconds)</span>
+        <span id="delayVal">2s</span>
       </div>
-      <input type="range" id="delaySlider" min="1" max="10" value="2" style="width: 100%;">
+      <input type="range" id="delaySlider" min="1" max="30" value="2" style="width: 100%;">
     </div>
   </div>
+
+  <div class="section-title">Prompt Slicing (1-based index)</div>
+  <div class="row">
+    <div>
+      <input type="number" id="startIndexInput" value="" min="1" placeholder="Start Prompt Index (default: 1)" />
+    </div>
+    <div>
+      <input type="number" id="endIndexInput" value="" min="1" placeholder="End Prompt Index (default: end)" />
+    </div>
+  </div>
+
+  <!-- Variables -->
+  <div class="section-title">Variables (Optional)</div>
+  <textarea id="variablesList" placeholder="[noesis] = a stick figure...&#10;[elder] = an old man..." style="height: 100px; margin-bottom: 16px;">[RedEye] = The character has a large, perfectly round white head with very messy, spiky black hair protruding in all directions, drawn using chaotic, sharp straight lines. A jagged, lightning-bolt-shaped crack or scar runs diagonally down the center of the face. The facial features are highly asymmetrical: the left eye is a simple, wide white circle with a tiny black dot for a pupil, while the right eye is an intense, heavily scribbled circle of bright red. There is no visible nose or mouth. The character is wearing a bulky black hoodie. The hoodie is colored using frantic, erratic black scribbles that heavily overlap but leave small, messy gaps of the white background showing through. The arms are thick black sleeves that end in hands made of thin, spindly black stick-lines for fingers. The left arm is slightly bent upwards at the elbow, and the right arm hangs straight down. The legs are drawn as simple, thin black stick lines extending from the bottom of the hoodie, ending in basic, blocky black boots.</textarea>
 
   <!-- Action Buttons -->
   <button class="btn btn-start" id="startBtn">🚀 Start Generating</button>
