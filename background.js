@@ -76,13 +76,40 @@ async function getProjectId(tabId) {
   return result?.[0]?.result || null;
 }
 
-// ---- Generate a single image via DOM automation ----
+// ---- CDP Trusted Click Helper (bypasses bot-detection with genuine hardware click) ----
+
+async function cdpClick(tabId, x, y) {
+  const target = { tabId };
+  let attached = false;
+  try {
+    await chrome.debugger.attach(target, '1.3');
+    attached = true;
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mousePressed', x, y, button: 'left', clickCount: 1
+    });
+    await sleep(80);
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mouseReleased', x, y, button: 'left', clickCount: 1
+    });
+    return true;
+  } catch (err) {
+    console.warn("CDP click failed, falling back:", err);
+    return false;
+  } finally {
+    if (attached) {
+      try { await chrome.debugger.detach(target); } catch (_) {}
+    }
+  }
+}
+
+// ---- Generate a single image via DOM automation + CDP ----
 
 async function generateSingleImage(tabId, promptText, timeoutMs = 2 * 60 * 1000) {
-  const result = await chrome.scripting.executeScript({
+  // 1. Prepare editor, type prompt, and calculate button screen coordinates
+  const prepResult = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: async (prompt, timeoutMs) => {
+    func: async (prompt) => {
       const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
       function getPromptBox() {
@@ -98,8 +125,13 @@ async function generateSingleImage(tabId, promptText, timeoutMs = 2 * 60 * 1000)
       }
 
       function getGenBtn(box) {
+        const icons = Array.from(document.querySelectorAll('mat-icon, i.google-symbols, i'));
+        const arrowBtn = icons.find(el => (el.textContent || '').trim() === 'arrow_forward')?.closest('button');
+        if (arrowBtn && arrowBtn.offsetParent !== null) return arrowBtn;
+
         box = box || getPromptBox();
-        return box?.querySelector('button[aria-label="Start generation"]') ||
+        return document.querySelector('button.generate-icon-button') ||
+               box?.querySelector('button[aria-label="Start generation"]') ||
                box?.querySelector('flow-generate-icon-button button[type="submit"]') ||
                document.querySelector('button[aria-label="Start generation"]') ||
                document.querySelector('flow-generate-icon-button button') || null;
@@ -116,81 +148,124 @@ async function generateSingleImage(tabId, promptText, timeoutMs = 2 * 60 * 1000)
           .filter(src => src && (src.includes('flow.google.com') || src.includes('google') || src.startsWith('blob:') || src.startsWith('data:')));
       }
 
-      try {
-        const ed = getEditor();
-        if (!ed) return { success: false, fatalError: 'Prompt editor not found — is a Flow project open?' };
+      const ed = getEditor();
+      if (!ed) return { success: false, fatalError: 'Prompt editor not found — is a Flow project open?' };
 
-        // 1. Snapshot all existing image URLs before generation starts
-        const existingImages = new Set(getAllImages());
+      const existingImages = getAllImages();
 
-        // 2. Type prompt using the verified execCommand method
-        ed.focus();
-        document.execCommand('selectAll', false, null);
-        document.execCommand('delete', false, null);
-        document.execCommand('insertText', false, prompt);
-        ed.dispatchEvent(new Event('input', { bubbles: true }));
-        await sleep(600);
+      // Type prompt using verified execCommand method
+      ed.focus();
+      document.execCommand('selectAll', false, null);
+      document.execCommand('delete', false, null);
+      document.execCommand('insertText', false, prompt);
+      ed.dispatchEvent(new Event('input', { bubbles: true }));
+      await sleep(600);
 
-        // 3. Find and verify Generate button is enabled
-        let btn = null;
-        for (let k = 0; k < 25; k++) {
-          btn = getGenBtn();
-          if (btn && !isOff(btn)) break;
-          await sleep(200);
-        }
-
-        if (!btn || isOff(btn)) {
-          return { success: false, error: 'Generate button remained disabled' };
-        }
-
-        // 4. Click Generate button using the verified event sequence
-        btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-        btn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
-        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-        btn.click();
-
-        // 5. Poll for the newly generated image
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-          await sleep(400);
-
-          // Check for error toasts / alerts
-          const toasts = Array.from(document.querySelectorAll('[role="alert"], .mat-mdc-snack-bar-container, mat-snack-bar-container'))
-            .filter(el => el.offsetParent !== null)
-            .map(el => (el.innerText || '').toLowerCase().trim()).filter(Boolean);
-
-          const rl = toasts.find(t => /rate limit|too many|try again later|quota|limit reached/.test(t));
-          if (rl) return { success: false, fatalError: 'Rate limited: ' + rl.substring(0, 160) };
-
-          const blocked = toasts.find(t => /unusual activity/.test(t));
-          if (blocked) return { success: false, fatalError: 'Account blocked: ' + blocked.substring(0, 160) };
-
-          const currentImages = getAllImages();
-          for (const src of currentImages) {
-            if (!existingImages.has(src)) {
-              // Smoothly scroll new tile into view
-              const imgEl = Array.from(document.querySelectorAll('img')).find(img => img.src === src);
-              const tile = imgEl?.closest('flow-tile-container, flow-grid-tile-container') || imgEl;
-              tile?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-              return { success: true, imageUrl: src };
-            }
-          }
-        }
-
-        return { success: false, error: 'Generation timed out after 120s' };
-      } catch (e) {
-        return { success: false, error: e.message || String(e) };
+      // Verify button is enabled
+      let btn = null;
+      for (let k = 0; k < 25; k++) {
+        btn = getGenBtn();
+        if (btn && !isOff(btn)) break;
+        await sleep(200);
       }
+
+      if (!btn || isOff(btn)) {
+        return { success: false, error: 'Generate button remained disabled' };
+      }
+
+      // Bring button into view and get its screen coordinates
+      btn.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      await sleep(50);
+      const rect = btn.getBoundingClientRect();
+      const x = Math.round(rect.left + rect.width / 2);
+      const y = Math.round(rect.top + rect.height / 2);
+
+      return { success: true, coords: { x, y }, existingImages };
     },
-    args: [promptText, timeoutMs]
+    args: [promptText]
   }).catch(() => null);
 
-  const response = result?.[0]?.result;
-  if (!response) throw new Error("Flow tab lost — is it still open?");
-  if (!response.success && response.fatalError) throw new Error(response.fatalError);
+  const prep = prepResult?.[0]?.result;
+  if (!prep) throw new Error("Flow tab lost — is it still open?");
+  if (!prep.success) {
+    if (prep.fatalError) throw new Error(prep.fatalError);
+    return prep;
+  }
 
-  return response;
+  // 2. Dispatch trusted OS-level click via Chrome DevTools Protocol (CDP)
+  const cdpOk = await cdpClick(tabId, prep.coords.x, prep.coords.y);
+  if (!cdpOk) {
+    // Fallback: synthetic click
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        const icons = Array.from(document.querySelectorAll('mat-icon, i.google-symbols, i'));
+        const btn = icons.find(el => (el.textContent || '').trim() === 'arrow_forward')?.closest('button') ||
+                    document.querySelector('button[aria-label="Start generation"]');
+        if (btn) {
+          const opts = { bubbles: true, cancelable: true, composed: true };
+          btn.dispatchEvent(new PointerEvent('pointerdown', opts));
+          btn.dispatchEvent(new MouseEvent('mousedown', opts));
+          btn.dispatchEvent(new PointerEvent('pointerup', opts));
+          btn.dispatchEvent(new MouseEvent('mouseup', opts));
+          btn.click();
+        }
+      }
+    }).catch(() => {});
+  }
+
+  // 3. Poll for the newly generated image on canvas
+  const pollResult = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: async (existingImgList, timeoutMs) => {
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      const existingSet = new Set(existingImgList);
+
+      function getAllImages() {
+        return Array.from(document.querySelectorAll('flow-tile-container img, flow-image-tile img, flow-grid-tile-container img, img'))
+          .map(i => i.src)
+          .filter(src => src && (src.includes('flow.google.com') || src.includes('google') || src.startsWith('blob:') || src.startsWith('data:')));
+      }
+
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        await sleep(400);
+
+        // Check for error toasts / alerts
+        const toasts = Array.from(document.querySelectorAll('[role="alert"], .mat-mdc-snack-bar-container, mat-snack-bar-container'))
+          .filter(el => el.offsetParent !== null)
+          .map(el => (el.innerText || '').toLowerCase().trim()).filter(Boolean);
+
+        const rl = toasts.find(t => /rate limit|too many|try again later|quota|limit reached/.test(t));
+        if (rl) return { success: false, fatalError: 'Rate limited: ' + rl.substring(0, 160) };
+
+        const blocked = toasts.find(t => /unusual activity/.test(t));
+        if (blocked) return { success: false, fatalError: 'Account blocked: ' + blocked.substring(0, 160) };
+
+        const currentImages = getAllImages();
+        for (const src of currentImages) {
+          if (!existingSet.has(src)) {
+            // Smoothly scroll new tile into view
+            const imgEl = Array.from(document.querySelectorAll('img')).find(img => img.src === src);
+            const tile = imgEl?.closest('flow-tile-container, flow-grid-tile-container') || imgEl;
+            tile?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            return { success: true, imageUrl: src };
+          }
+        }
+      }
+
+      return { success: false, error: 'Generation timed out after 120s' };
+    },
+    args: [prep.existingImages, timeoutMs]
+  }).catch(() => null);
+
+  const poll = pollResult?.[0]?.result;
+  if (!poll) throw new Error("Flow tab lost during generation polling.");
+  if (!poll.success && poll.fatalError) throw new Error(poll.fatalError);
+
+  return poll;
 }
 
 // ---- Download an image as PNG (Chrome-native approach) ----
