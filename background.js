@@ -77,223 +77,125 @@ async function getProjectId(tabId) {
 }
 
 // ---- Generate a single image via DOM automation ----
-// Types the prompt into ProseMirror, clicks "Start generation",
-// then polls the tile grid for a new completed image.
 
-async function generateImage(tabId, projectId, prompt, settings) {
-  const timeoutMs = 5 * 60 * 1000; // 5 minutes
-
+async function generateSingleImage(tabId, promptText, timeoutMs = 2 * 60 * 1000) {
   const result = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: async (promptText, timeoutMs) => {
+    func: async (prompt, timeoutMs) => {
       const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-      // ---- DOM helpers ----
       function getPromptBox() {
-        const boxes = Array.from(document.querySelectorAll('.base-prompt-box'));
-        return boxes.find(el => el.offsetParent !== null && el.getClientRects().length > 0) ||
-               boxes[0] || null;
+        const boxes = Array.from(document.querySelectorAll('.base-prompt-box, flow-prompt-box, .prompt-box-container'));
+        return boxes.find(el => el.offsetParent !== null && el.getClientRects().length > 0) || boxes[0] || null;
       }
+
       function getEditor(box) {
         box = box || getPromptBox();
         return box?.querySelector('flow-rich-text-editor .ProseMirror[contenteditable="true"]') ||
-               box?.querySelector('.ProseMirror[contenteditable="true"]') || null;
+               box?.querySelector('.ProseMirror[contenteditable="true"]') ||
+               document.querySelector('.ProseMirror[contenteditable="true"]') || null;
       }
+
       function getGenBtn(box) {
         box = box || getPromptBox();
         return box?.querySelector('button[aria-label="Start generation"]') ||
-               box?.querySelector('flow-generate-icon-button button[type="submit"]') || null;
+               box?.querySelector('flow-generate-icon-button button[type="submit"]') ||
+               document.querySelector('button[aria-label="Start generation"]') ||
+               document.querySelector('flow-generate-icon-button button') || null;
       }
-      function editorText(ed) {
-        ed = ed || getEditor();
-        if (!ed) return '';
-        const c = ed.cloneNode(true);
-        c.querySelectorAll('.prosemirror-placeholder, .ProseMirror-widget').forEach(n => n.remove());
-        return (c.innerText || c.textContent || '').replace(/\u00a0/g, ' ').trim();
-      }
+
       function isOff(btn) {
         return !btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true' ||
                btn.classList.contains('mat-mdc-button-disabled');
       }
-      const norm = s => s.replace(/\s+/g, ' ').trim().toLowerCase();
 
-      // ---- Clear the editor ----
-      async function clearEditor() {
-        const clrBtn = getPromptBox()?.querySelector('button[aria-label="Clear prompt"]');
-        if (clrBtn) { clrBtn.click(); await sleep(300); }
-        const ed = getEditor();
-        if (ed && editorText(ed)) {
-          ed.focus();
-          try {
-            const sel = window.getSelection(), range = document.createRange();
-            range.selectNodeContents(ed); sel.removeAllRanges(); sel.addRange(range);
-            document.execCommand('delete', false, null);
-          } catch (e) {}
-          await sleep(150);
-        }
-        // Remove any ingredient chips
-        for (let i = 0; i < 12; i++) {
-          const chip = getPromptBox()?.querySelector('flow-ingredient-bar button.chip-container');
-          if (!chip) break;
-          const icon = chip.querySelector('.hover-icon-overlay, mat-icon');
-          (icon || chip).click();
-          await sleep(200);
-        }
+      function getAllImages() {
+        return Array.from(document.querySelectorAll('flow-tile-container img, flow-image-tile img, flow-grid-tile-container img, img'))
+          .map(i => i.src)
+          .filter(src => src && (src.includes('flow.google.com') || src.includes('google') || src.startsWith('blob:') || src.startsWith('data:')));
       }
 
-      // ---- Type into ProseMirror ----
-      async function typePrompt(text) {
-        await clearEditor();
-        const ed = getEditor();
-        if (!ed) return false;
-        ed.focus();
-        try {
-          const sel = window.getSelection(), range = document.createRange();
-          range.selectNodeContents(ed); range.collapse(false);
-          sel.removeAllRanges(); sel.addRange(range);
-        } catch (e) {}
-
-        // Method 1: clipboard paste
-        const dt = new DataTransfer();
-        dt.setData('text/plain', text);
-        ed.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
-        await sleep(300);
-        if (norm(editorText()) === norm(text)) return true;
-
-        // Method 2: execCommand
-        await clearEditor(); getEditor()?.focus();
-        try { document.execCommand('insertText', false, text); } catch (e) {}
-        await sleep(300);
-        if (norm(editorText()) === norm(text)) return true;
-
-        // Method 3: InputEvent
-        await clearEditor(); const ed3 = getEditor(); ed3?.focus();
-        try {
-          ed3.dispatchEvent(new InputEvent('beforeinput', {
-            inputType: 'insertText', data: text, bubbles: true, cancelable: true
-          }));
-        } catch (e) {}
-        await sleep(300);
-        return norm(editorText()) === norm(text);
-      }
-
-      // ---- Tile helpers ----
-      function resultTiles() {
-        return Array.from(document.querySelectorAll('flow-grid-tile-container'))
-          .filter(el => !el.querySelector('flow-collection-tile'));
-      }
-      function pendingTiles() {
-        return Array.from(document.querySelectorAll('flow-pending-tile'));
-      }
-      function parseTile(tile) {
-        const img = tile.querySelector('img[data-media-id], img.image, img.thumbnail, img');
-        const vid = tile.querySelector('video');
-        const isPending = !!tile.querySelector('flow-pending-tile');
-        const mediaId = img?.getAttribute('data-media-id') || '';
-        const src = img?.src || vid?.src || '';
-        return { isPending, mediaId, src };
-      }
-
-      // ============ MAIN FLOW ============
       try {
-        if (!getEditor()) return { success: false, error: 'Prompt editor not found — is a Flow project open?' };
+        const ed = getEditor();
+        if (!ed) return { success: false, fatalError: 'Prompt editor not found — is a Flow project open?' };
 
-        // 1. Snapshot existing tile IDs
-        const existingIds = new Set(
-          resultTiles().map(parseTile)
-            .filter(t => !t.isPending && (t.mediaId || t.src))
-            .map(t => t.mediaId || t.src)
-        );
+        // 1. Snapshot all existing image URLs before generation starts
+        const existingImages = new Set(getAllImages());
 
-        // 2. Type the prompt
-        if (!await typePrompt(promptText)) {
-          return { success: false, error: 'Could not type prompt into the Flow editor' };
-        }
+        // 2. Type prompt using the verified execCommand method
+        ed.focus();
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
+        document.execCommand('insertText', false, prompt);
+        ed.dispatchEvent(new Event('input', { bubbles: true }));
+        await sleep(600);
 
-        // 3. Wait for the Generate button to become enabled
+        // 3. Find and verify Generate button is enabled
         let btn = null;
-        for (let i = 0; i < 25; i++) {
+        for (let k = 0; k < 25; k++) {
           btn = getGenBtn();
           if (btn && !isOff(btn)) break;
           await sleep(200);
         }
+
         if (!btn || isOff(btn)) {
-          return { success: false, error: 'Generate button is disabled or not found' };
+          return { success: false, error: 'Generate button remained disabled' };
         }
 
-        // 4. Click Generate
+        // 4. Click Generate button using the verified event sequence
+        btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        btn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
         btn.click();
-        await sleep(500);
 
-        // 5. Wait for generation to start (pending tiles appear or prompt clears)
-        let started = false;
-        for (let i = 0; i < 30; i++) {
-          if (pendingTiles().length > 0) { started = true; break; }
-          if (!editorText() && isOff(getGenBtn())) { started = true; break; }
-          await sleep(200);
-        }
-        if (!started) {
-          // Retry click
-          const btn2 = getGenBtn();
-          if (btn2 && !isOff(btn2)) { btn2.click(); await sleep(1000); }
-        }
-
-        // 6. Poll for completion
+        // 5. Poll for the newly generated image
         const deadline = Date.now() + timeoutMs;
-        let sawPending = false;
-
         while (Date.now() < deadline) {
-          const pending = pendingTiles();
+          await sleep(400);
 
-          // Check for generation failures inside pending tiles
-          for (const pt of pending) {
-            const txt = (pt.innerText || '').toLowerCase();
-            if (/fail|error|couldn|could not|try again|blocked|violat|unsafe|not allowed|policy/.test(txt)) {
-              return { success: false, error: 'Generation failed: ' + txt.substring(0, 160) };
-            }
-          }
-
-          // Check toast/snackbar errors
+          // Check for error toasts / alerts
           const toasts = Array.from(document.querySelectorAll('[role="alert"], .mat-mdc-snack-bar-container, mat-snack-bar-container'))
             .filter(el => el.offsetParent !== null)
             .map(el => (el.innerText || '').toLowerCase().trim()).filter(Boolean);
+
           const rl = toasts.find(t => /rate limit|too many|try again later|quota|limit reached/.test(t));
-          if (rl) return { success: false, error: 'Rate limited: ' + rl.substring(0, 160) };
+          if (rl) return { success: false, fatalError: 'Rate limited: ' + rl.substring(0, 160) };
+
           const blocked = toasts.find(t => /unusual activity/.test(t));
-          if (blocked) return { success: false, error: 'Account blocked: ' + blocked.substring(0, 160) };
+          if (blocked) return { success: false, fatalError: 'Account blocked: ' + blocked.substring(0, 160) };
 
-          if (pending.length > 0) sawPending = true;
-
-          // Look for new completed tiles
-          const newTiles = resultTiles().map(parseTile)
-            .filter(t => !t.isPending && (t.mediaId || t.src) && !existingIds.has(t.mediaId || t.src));
-
-          if (newTiles.length > 0 && (pending.length === 0 || sawPending)) {
-            return { success: true, imageUrl: newTiles[0].src, mediaId: newTiles[0].mediaId };
+          const currentImages = getAllImages();
+          for (const src of currentImages) {
+            if (!existingImages.has(src)) {
+              // Smoothly scroll new tile into view
+              const imgEl = Array.from(document.querySelectorAll('img')).find(img => img.src === src);
+              const tile = imgEl?.closest('flow-tile-container, flow-grid-tile-container') || imgEl;
+              tile?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+              return { success: true, imageUrl: src };
+            }
           }
-
-          await sleep(500);
         }
 
-        return { success: false, error: 'Generation timed out after ' + Math.round(timeoutMs / 1000) + 's' };
+        return { success: false, error: 'Generation timed out after 120s' };
       } catch (e) {
         return { success: false, error: e.message || String(e) };
       }
     },
-    args: [prompt, timeoutMs]
+    args: [promptText, timeoutMs]
   }).catch(() => null);
 
   const response = result?.[0]?.result;
   if (!response) throw new Error("Flow tab lost — is it still open?");
-  if (!response.success) throw new Error(response.error);
+  if (!response.success && response.fatalError) throw new Error(response.fatalError);
 
-  return response.imageUrl;
+  return response;
 }
 
 // ---- Download an image as PNG (Chrome-native approach) ----
 
-async function downloadImage(tabId, imageUrl, filename) {
+async function downloadImage(tabId, imageUrl, filename, conflictAction) {
   const result = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
@@ -334,14 +236,13 @@ async function downloadImage(tabId, imageUrl, filename) {
       url: imgResult.blobUrl,
       filename: filename,
       saveAs: false,
-      conflictAction: "uniquify"
+      conflictAction: conflictAction || "uniquify"
     }, (downloadId) => {
       if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
       resolve(downloadId);
     });
   });
 
-  // Clean up blob URL
   chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
@@ -419,17 +320,16 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
   }
 
   const variables = parseVariables(settings.variablesText);
-  const delayMin = (settings.delayMin ?? 6) * 1000;
-  const delayMax = (settings.delayMax ?? 12) * 1000;
-  const total = entries.length;
+  const delaySec = Math.max(1, parseInt(settings.delay, 10) || 2);
+  const total = manifest.prompts.length;
   let completed = 0;
 
   broadcast("BATCH_STARTED", { total });
 
   for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
     if (stopRequested) {
       broadcast("BATCH_PROGRESS", { index: i, total, status: "stopped", message: "Stopped by user." });
-      // Mark remaining entries as pending so they can be resumed
       for (let j = i; j < entries.length; j++) {
         if (entries[j].status !== "done") entries[j].status = "pending";
       }
@@ -437,60 +337,53 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
       break;
     }
 
-    const entry = entries[i];
-    const prompt = applyVariables(entry.prompt, variables);
     const label = logPrefix ? `[${logPrefix} ${entry.imageNum}]` : `[${entry.imageNum}/${manifest.prompts.length}]`;
-    const promptPreview = prompt.substring(0, 60) + (prompt.length > 60 ? "…" : "");
+    const prompt = applyVariables(entry.prompt, variables);
 
     broadcast("BATCH_PROGRESS", {
       index: i, total, status: "generating",
-      message: `${label} Generating: "${promptPreview}"`
+      message: `${label} Generating: "${prompt.substring(0, 50)}…"`
     });
 
     try {
-      const mediaId = await generateImage(tab.id, projectId, prompt, settings);
+      const response = await generateSingleImage(tab.id, prompt);
+      if (!response.success || !response.imageUrl) {
+        throw new Error(response.error || "Generation failed in Flow");
+      }
 
-      broadcast("BATCH_PROGRESS", {
-        index: i, total, status: "downloading",
-        message: `${label} Downloading...`
-      });
-
+      broadcast("BATCH_PROGRESS", { index: i, total, status: "downloading", message: `${label} Downloading...` });
       const filename = getFilename(entry.imageNum, prompt, settings);
-      await downloadImage(tab.id, mediaId, filename);
 
-      completed++;
-      entry.status = "done";
-      delete entry.error;
+      try {
+        await downloadImage(tab.id, response.imageUrl, filename, settings.conflictAction || "uniquify");
+        completed++;
+        entry.status = "done";
+        delete entry.error;
+        broadcast("BATCH_PROGRESS", { index: i, total, status: "done", message: `${label} ✅ Saved: ${filename}` });
+      } catch (dlErr) {
+        entry.status = "failed";
+        entry.error = "Download failed: " + dlErr.message;
+        broadcast("BATCH_PROGRESS", { index: i, total, status: "failed", message: `${label} ❌ ${entry.error}` });
+      }
       saveManifest(manifest);
 
-      broadcast("BATCH_PROGRESS", {
-        index: i, total, status: "done",
-        message: `${label} ✅ Saved: ${filename}`
-      });
-
       if (i < entries.length - 1 && !stopRequested) {
-        const delay = delayMin + Math.random() * (delayMax - delayMin);
-        const delaySec = Math.ceil(delay / 1000);
         broadcast("BATCH_PROGRESS", {
-          index: i + 1, total, status: "waiting",
+          index: i, total, status: "waiting",
           message: `Waiting ${delaySec}s before next prompt...`
         });
-        await sleep(delay);
+        await sleep(delaySec * 1000);
       }
 
     } catch (err) {
       entry.status = "failed";
       entry.error = err.message;
       saveManifest(manifest);
+      broadcast("BATCH_PROGRESS", { index: i, total, status: "failed", message: `${label} ❌ ${err.message}` });
 
-      // Fatal errors: stop immediately
-      if (err.message.includes("quota") || err.message.includes("auth") || err.message.includes("403")) {
-        broadcast("BATCH_PROGRESS", {
-          index: i, total, status: "failed",
-          message: `${label} ❌ ${err.message}`
-        });
+      const isFatal = /quota|auth|blocked|rate limit|403|unusual activity/i.test(err.message);
+      if (isFatal) {
         broadcast("BATCH_ERROR", { message: "⛔ Fatal: " + err.message });
-        // Mark remaining entries as pending
         for (let j = i + 1; j < entries.length; j++) {
           if (entries[j].status !== "done") entries[j].status = "pending";
         }
@@ -498,25 +391,16 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
         break;
       }
 
-      // Non-fatal: skip and continue
-      broadcast("BATCH_PROGRESS", {
-        index: i, total, status: "failed",
-        message: `${label} ❌ Skipped — ${err.message}`
-      });
-
       if (i < entries.length - 1 && !stopRequested) {
-        const delay = delayMin + Math.random() * (delayMax - delayMin);
-        const delaySec = Math.ceil(delay / 1000);
         broadcast("BATCH_PROGRESS", {
-          index: i + 1, total, status: "waiting",
+          index: i, total, status: "waiting",
           message: `Waiting ${delaySec}s before next prompt...`
         });
-        await sleep(delay);
+        await sleep(delaySec * 1000);
       }
     }
   }
 
-  // Build final report from manifest
   const doneCount = manifest.prompts.filter(p => p.status === "done").length;
   const failedEntries = manifest.prompts.filter(p => p.status === "failed");
   const pendingEntries = manifest.prompts.filter(p => p.status === "pending");
@@ -533,14 +417,8 @@ async function processEntries(entries, manifest, settings, logPrefix = "") {
     pendingNums
   });
 
-  // Only clear manifest if everything is done
   if (failedEntries.length === 0 && pendingEntries.length === 0) {
     chrome.storage.local.remove(['manifest']);
-  }
-
-  if (completed > 0 && tab.id) {
-    await sleep(300);
-    chrome.tabs.reload(tab.id);
   }
 }
 
@@ -555,6 +433,10 @@ async function runBatch(config) {
   if (config.manifest) {
     // Imported or resumed manifest
     manifest = config.manifest;
+    if (settings) {
+      manifest.settings = { ...manifest.settings, ...settings };
+      saveManifest(manifest);
+    }
   } else {
     manifest = buildManifest(prompts, settings);
     saveManifest(manifest);
@@ -630,6 +512,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "STOP_BATCH") {
     stopRequested = true;
     sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === "REGENERATE_SELECTED") {
+    sendResponse({ ok: true });
+    chrome.storage.local.get(['manifest'], (data) => {
+      if (!data.manifest) return;
+      const manifest = data.manifest;
+      
+      if (message.settings) {
+        manifest.settings = { ...manifest.settings, ...message.settings };
+      }
+      
+      const nums = new Set(message.nums);
+      manifest.prompts.forEach(p => {
+        if (nums.has(p.imageNum)) {
+          p.status = "pending";
+          delete p.error;
+        }
+      });
+      saveManifest(manifest);
+      
+      stopRequested = false;
+      const pendingEntries = manifest.prompts.filter(p => nums.has(p.imageNum));
+      processEntries(pendingEntries, manifest, manifest.settings, "Regenerate").catch(err => {
+        broadcast("BATCH_ERROR", { message: "Fatal error: " + err.message });
+      });
+    });
     return false;
   }
 

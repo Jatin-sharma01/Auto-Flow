@@ -300,6 +300,40 @@
       margin: 16px 0;
     }
 
+    /* Tags */
+    .tags-container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 16px;
+      max-height: 120px;
+      overflow-y: auto;
+      padding: 8px;
+      background: rgba(0,0,0,0.15);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 8px;
+    }
+    .tag {
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.15s;
+      border: 1px solid transparent;
+    }
+    .tag.done { background: rgba(34,197,94,0.15); color: #22c55e; }
+    .tag.failed { background: rgba(239,68,68,0.15); color: #ef4444; }
+    .tag.pending { background: rgba(107,114,128,0.2); color: #9ca3af; }
+    .tag:hover { filter: brightness(1.2); }
+    .tag.selected {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 1px #3b82f6;
+      background: rgba(59,130,246,0.25);
+      color: #60a5fa;
+    }
+
     /* Animations */
     @keyframes pulse {
       0%, 100% { opacity: 1; }
@@ -370,7 +404,26 @@
       </select>
     </div>
     <div>
-      <input type="text" id="folderInput" value="Flow_Images" placeholder="Save Folder Name" />
+      <select id="conflictSelect">
+        <option value="overwrite" selected>🔄 Overwrite (Clean Nums)</option>
+        <option value="uniquify">🆕 Keep both (Adds (1))</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="row">
+    <div style="width: 100%; margin-bottom: 16px;">
+      <input type="text" id="folderInput" value="Flow_Images" placeholder="Save Folder Name" style="margin-bottom: 0;" />
+    </div>
+  </div>
+
+  <div class="row">
+    <div style="width: 100%; margin-bottom: 16px;">
+      <div class="section-title" style="display: flex; justify-content: space-between;">
+        <span>Delay Between Prompts</span>
+        <span><span id="delayVal">2</span>s</span>
+      </div>
+      <input type="range" id="delaySlider" min="1" max="10" value="2" style="width: 100%;">
     </div>
   </div>
 
@@ -391,6 +444,11 @@
 
   <!-- Divider -->
   <div class="divider"></div>
+
+  <!-- Regenerate Section -->
+  <div class="section-title" id="regenerateTitle" style="display: none;">Regenerate Specific Images</div>
+  <div class="tags-container" id="regenerateTags" style="display: none;"></div>
+  <button class="btn btn-retry" id="regenerateBtn" style="display: none; margin-bottom: 16px;">🔄 Regenerate Selected</button>
 
   <!-- Log -->
   <div class="log-container" id="logContainer"></div>

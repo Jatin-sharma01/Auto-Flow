@@ -19,6 +19,18 @@ const statusText = document.getElementById("statusText");
 const uploadBtn = document.getElementById("uploadBtn");
 const fileInput = document.getElementById("fileInput");
 const promptCount = document.getElementById("promptCount");
+const delaySlider = document.getElementById("delaySlider");
+const delayVal = document.getElementById("delayVal");
+const regenerateTitle = document.getElementById("regenerateTitle");
+const regenerateTags = document.getElementById("regenerateTags");
+const regenerateBtn = document.getElementById("regenerateBtn");
+
+// ---- Delay Slider ----
+if (delaySlider) {
+  delaySlider.addEventListener("input", (e) => {
+    if (delayVal) delayVal.textContent = e.target.value;
+  });
+}
 
 // ---- Prompt counter ----
 
@@ -111,13 +123,14 @@ startBtn.addEventListener("click", () => {
     return;
   }
 
+  const delaySec = parseInt(document.getElementById("delaySlider")?.value, 10) || 2;
   const settings = {
     model: document.getElementById("modelSelect").value,
     aspectRatio: document.getElementById("aspectSelect").value,
     fileNaming: document.getElementById("namingSelect").value,
+    conflictAction: document.getElementById("conflictSelect").value,
     folder: document.getElementById("folderInput").value.trim() || "Flow_Images",
-    delayMin: 6,
-    delayMax: 12,
+    delay: delaySec,
     variablesText: variablesList.value
   };
 
@@ -230,6 +243,76 @@ function resetButtons() {
   promptList.disabled = false;
 }
 
+// ---- Regenerate Tags ----
+
+function renderTags(manifest) {
+  regenerateTags.innerHTML = "";
+  if (!manifest || !manifest.prompts || manifest.prompts.length === 0) {
+    regenerateTitle.style.display = "none";
+    regenerateTags.style.display = "none";
+    regenerateBtn.style.display = "none";
+    return;
+  }
+  
+  regenerateTitle.style.display = "block";
+  regenerateTags.style.display = "flex";
+  
+  manifest.prompts.forEach(p => {
+    const tag = document.createElement("div");
+    tag.className = `tag ${p.status}`;
+    tag.textContent = `#${p.imageNum}`;
+    tag.dataset.num = p.imageNum;
+    
+    tag.addEventListener("click", () => {
+      tag.classList.toggle("selected");
+      updateRegenerateBtn();
+    });
+    
+    regenerateTags.appendChild(tag);
+  });
+  updateRegenerateBtn();
+}
+
+function updateRegenerateBtn() {
+  const selected = regenerateTags.querySelectorAll(".tag.selected").length;
+  if (selected > 0) {
+    regenerateBtn.style.display = "flex";
+    regenerateBtn.textContent = `🔄 Regenerate Selected (${selected})`;
+  } else {
+    regenerateBtn.style.display = "none";
+  }
+}
+
+regenerateBtn.addEventListener("click", () => {
+  const selected = Array.from(regenerateTags.querySelectorAll(".tag.selected")).map(t => parseInt(t.dataset.num, 10));
+  if (selected.length === 0) return;
+  
+  logContainer.innerHTML = "";
+  logContainer.classList.add("visible");
+  summary.classList.remove("visible");
+  
+  startBtn.style.display = "none";
+  retryBtn.style.display = "none";
+  stopBtn.style.display = "flex";
+  clearBtn.style.display = "none";
+  exportBtn.style.display = "none";
+  regenerateBtn.style.display = "none";
+  promptList.disabled = true;
+
+  const delaySec = parseInt(document.getElementById("delaySlider")?.value, 10) || 2;
+  const settings = {
+    model: document.getElementById("modelSelect").value,
+    aspectRatio: document.getElementById("aspectSelect").value,
+    fileNaming: document.getElementById("namingSelect").value,
+    conflictAction: document.getElementById("conflictSelect").value,
+    folder: document.getElementById("folderInput").value.trim() || "Flow_Images",
+    delay: delaySec,
+    variablesText: variablesList.value
+  };
+
+  chrome.runtime.sendMessage({ type: "REGENERATE_SELECTED", nums: selected, settings });
+});
+
 // ---- Retry Failed ----
 
 retryBtn.addEventListener("click", () => {
@@ -309,7 +392,14 @@ importFileInput.addEventListener("change", (e) => {
             if (manifest.settings.model) document.getElementById("modelSelect").value = manifest.settings.model;
             if (manifest.settings.aspectRatio) document.getElementById("aspectSelect").value = manifest.settings.aspectRatio;
             if (manifest.settings.fileNaming) document.getElementById("namingSelect").value = manifest.settings.fileNaming;
+            if (manifest.settings.conflictAction) document.getElementById("conflictSelect").value = manifest.settings.conflictAction;
             if (manifest.settings.folder) document.getElementById("folderInput").value = manifest.settings.folder;
+            if (manifest.settings.delay) {
+              const el = document.getElementById("delaySlider");
+              if (el) el.value = manifest.settings.delay;
+              const valEl = document.getElementById("delayVal");
+              if (valEl) valEl.textContent = manifest.settings.delay;
+            }
             if (manifest.settings.variablesText) variablesList.value = manifest.settings.variablesText;
           }
 
@@ -331,6 +421,7 @@ importFileInput.addEventListener("change", (e) => {
             retryBtn.textContent = `🔄 Retry Failed (${failedNums})`;
           }
           exportBtn.style.display = "flex";
+          renderTags(manifest);
 
           importBtn.textContent = "✅ Imported!";
           setTimeout(() => { importBtn.textContent = "📤 Import Progress"; }, 2000);
@@ -361,6 +452,7 @@ clearBtn.addEventListener("click", () => {
     retryBtn.style.display = "none";
     exportBtn.style.display = "none";
     
+    renderTags(null);
     startBtn.textContent = "🚀 Start Generating";
     
     chrome.storage.local.remove(['manifest']);
@@ -378,8 +470,7 @@ chrome.storage.local.get(['manifest'], (data) => {
   const pending = manifest.prompts.filter(p => p.status === "pending").length;
   const total = manifest.prompts.length;
 
-  // Only show resume UI if there's unfinished work
-  if (failed === 0 && pending === 0) return;
+  renderTags(manifest);
 
   // Populate prompts from manifest
   promptList.value = manifest.prompts.map(p => p.prompt).join("\n");
@@ -390,7 +481,14 @@ chrome.storage.local.get(['manifest'], (data) => {
     if (manifest.settings.model) document.getElementById("modelSelect").value = manifest.settings.model;
     if (manifest.settings.aspectRatio) document.getElementById("aspectSelect").value = manifest.settings.aspectRatio;
     if (manifest.settings.fileNaming) document.getElementById("namingSelect").value = manifest.settings.fileNaming;
+    if (manifest.settings.conflictAction) document.getElementById("conflictSelect").value = manifest.settings.conflictAction;
     if (manifest.settings.folder) document.getElementById("folderInput").value = manifest.settings.folder;
+    if (manifest.settings.delay) {
+      const el = document.getElementById("delaySlider");
+      if (el) el.value = manifest.settings.delay;
+      const valEl = document.getElementById("delayVal");
+      if (valEl) valEl.textContent = manifest.settings.delay;
+    }
     if (manifest.settings.variablesText) variablesList.value = manifest.settings.variablesText;
   }
 
